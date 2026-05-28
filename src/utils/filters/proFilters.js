@@ -55,61 +55,39 @@ function applyKernel(src, kernel, radius) {
 function clampCoord(v, max) { return Math.max(0, Math.min(max, v)); }
 
 /**
- * Magic Pro / Omnifix
+ * Magic Pro / Omnifix (Powered by OpenCV.js)
  * Local adaptive thresholding + contrast stretching.
  * Flattens paper wrinkles and uneven background lighting.
  */
 export function filterOmnifix(src) {
-  const { width, height, data } = src;
-  const blockSize = 31; // odd number
-  const C = 8; // constant subtracted from mean
-  const out = new Uint8ClampedArray(data.length);
-
-  // Integral image for fast block mean
-  const gray = new Float32Array(width * height);
-  for (let i = 0; i < width * height; i++) {
-    gray[i] = 0.299 * data[i * 4] + 0.587 * data[i * 4 + 1] + 0.114 * data[i * 4 + 2];
+  if (typeof cv === 'undefined' || !cv.Mat) {
+    console.warn("OpenCV not loaded, returning original");
+    return src;
   }
+  
+  try {
+    const mat = cv.matFromImageData(src);
+    const gray = new cv.Mat();
+    cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
 
-  // Build integral image
-  const integral = new Float64Array((width + 1) * (height + 1));
-  for (let y = 1; y <= height; y++) {
-    for (let x = 1; x <= width; x++) {
-      integral[y * (width + 1) + x] =
-        gray[(y - 1) * width + (x - 1)] +
-        integral[(y - 1) * (width + 1) + x] +
-        integral[y * (width + 1) + (x - 1)] -
-        integral[(y - 1) * (width + 1) + (x - 1)];
-    }
+    const out = new cv.Mat();
+    // CamScanner algorithm equivalent: Adaptive Thresholding
+    // maxValue = 255, method = MEAN_C, type = BINARY, blockSize = 31, C = 15
+    cv.adaptiveThreshold(gray, out, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY, 31, 15);
+
+    // Convert 1-channel binary back to 4-channel RGBA for canvas rendering
+    const rgba = new cv.Mat();
+    cv.cvtColor(out, rgba, cv.COLOR_GRAY2RGBA);
+
+    const dstData = new Uint8ClampedArray(rgba.data);
+    const imgData = new ImageData(dstData, src.width, src.height);
+
+    mat.delete(); gray.delete(); out.delete(); rgba.delete();
+    return imgData;
+  } catch (err) {
+    console.error("OpenCV filter failed:", err);
+    return src;
   }
-
-  const half = Math.floor(blockSize / 2);
-
-  for (let py = 0; py < height; py++) {
-    for (let px = 0; px < width; px++) {
-      const x1 = Math.max(0, px - half);
-      const y1 = Math.max(0, py - half);
-      const x2 = Math.min(width - 1, px + half);
-      const y2 = Math.min(height - 1, py + half);
-      const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-      const sum =
-        integral[(y2 + 1) * (width + 1) + (x2 + 1)] -
-        integral[y1 * (width + 1) + (x2 + 1)] -
-        integral[(y2 + 1) * (width + 1) + x1] +
-        integral[y1 * (width + 1) + x1];
-      const mean = sum / count;
-
-      const srcIdx = (py * width + px) * 4;
-      const gVal = gray[py * width + px];
-      const binaryVal = gVal >= mean - C ? 255 : 0;
-
-      out[srcIdx]     = binaryVal;
-      out[srcIdx + 1] = binaryVal;
-      out[srcIdx + 2] = binaryVal;
-      out[srcIdx + 3] = data[srcIdx + 3];
-    }
-  }
-  return new ImageData(out, width, height);
 }
 
 /**

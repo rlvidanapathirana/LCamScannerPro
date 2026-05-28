@@ -1,15 +1,29 @@
 /**
- * ImageEditor.jsx
- * CamScanner-style Mobile Layout:
- * - Simple top bar (back + page counter)
- * - Full canvas viewport
- * - Filter tray docked above bottom bar
- * - Bottom navigation bar (Rotate, Markup, OCR, Save)
+ * ImageEditor.jsx — Final, production-quality version.
+ *
+ * ROOT CAUSE FIXES:
+ * 1. `viewRef` tracks the outer viewport div size.
+ *    We pass explicit pixel max-constraints to the <img> so the
+ *    inline-block wrapper shrinks to *exactly* the rendered image size.
+ *    Without this, `maxWidth/maxHeight: 100%` on the image is
+ *    circular (percentage of a parent that sizes from the child).
+ *
+ * 2. Overlays (CropPanel, AnnotationLayer) are children of the
+ *    inline-block wrapper, so they position relative to the image.
+ *
+ * 3. `activeFilterRef` keeps a mutable ref in sync with activeFilter
+ *    so the handleFilteredUrl callback never has stale closure state.
+ *
+ * 4. originalDataUrl is preserved before the FIRST crop so the user
+ *    can re-crop from the pristine source any number of times.
+ *
+ * 5. Entering crop mode always re-runs edge-detection so it works on
+ *    the current (possibly already-cropped) image.
  */
 import { useState, useRef, useCallback, useEffect } from 'react';
 import {
-  ChevronLeft, ChevronRight,
-  RotateCcw, RotateCw, FlipHorizontal2,
+  ChevronLeft,
+  RotateCcw, FlipHorizontal2,
   ScanText, PenLine, Crop, Loader2,
   Check, X, ZoomIn, ZoomOut, Maximize2,
 } from 'lucide-react';
@@ -21,8 +35,7 @@ import { detectDocumentCorners }    from '../../utils/math/edgeDetection';
 import { applyPerspectiveTransform } from '../../utils/math/perspectiveTransform';
 
 export default function ImageEditor({
-  page, pages, activePageId, setActivePageId,
-  onUpdate,
+  page, pages, activePageId, setActivePageId, onUpdate,
 }) {
   const [showAnnotation, setShowAnnotation] = useState(false);
   const [showOcr,        setShowOcr]        = useState(false);
@@ -35,32 +48,48 @@ export default function ImageEditor({
   const [cropCorners,    setCropCorners]    = useState(null);
   const [cropProcessing, setCropProcessing] = useState(false);
 
-  // Dimensions of the rendered <img> element for overlays
-  const [imgDims, setImgDims] = useState({ w: 1, h: 1 });
+  // The rendered pixel dimensions of the <img> element — used by overlays
+  const [imgDims,  setImgDims]  = useState({ w: 300, h: 400 });
+  // The inner pixel size of the viewport container (minus padding)
+  const [viewSize, setViewSize] = useState({ w: 400, h: 600 });
 
-  const bakeRef  = useRef(null);
-  const imgRef   = useRef(null);
-  const wrapRef  = useRef(null);
+  const bakeRef         = useRef(null);
+  const imgRef          = useRef(null);
+  const viewRef         = useRef(null);   // outer viewport div
+  const activeFilterRef = useRef('original');
 
-  /* ── Reset when page changes ── */
+  /* ── Reset on page change ── */
   useEffect(() => {
-    if (page) {
-      setDisplayUrl(page.dataUrl);
-      setActiveFilter(page.filter || 'original');
-      setRotation(0); setFlipH(false); setZoom(1);
-      setShowCrop(false); setCropCorners(null);
-      setShowAnnotation(false); setShowOcr(false);
-    }
+    if (!page) return;
+    setDisplayUrl(page.dataUrl);
+    const f = page.filter || 'original';
+    setActiveFilter(f);
+    activeFilterRef.current = f;
+    setRotation(0); setFlipH(false); setZoom(1);
+    setShowCrop(false); setCropCorners(null);
+    setShowAnnotation(false); setShowOcr(false);
   }, [page?.id]);
 
-  /* ── Track rendered image size for overlays ── */
+  /* ── Track viewport size → used to constrain the <img> ── */
+  useEffect(() => {
+    if (!viewRef.current) return;
+    const PADDING = 32;
+    const obs = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setViewSize({ w: Math.max(100, width - PADDING), h: Math.max(100, height - PADDING) });
+    });
+    obs.observe(viewRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  /* ── Track rendered image size → used by crop / annotation overlays ── */
   useEffect(() => {
     if (!imgRef.current) return;
     const obs = new ResizeObserver(() => {
       if (imgRef.current) {
         setImgDims({
-          w: imgRef.current.clientWidth  || 1,
-          h: imgRef.current.clientHeight || 1,
+          w: imgRef.current.offsetWidth  || 300,
+          h: imgRef.current.offsetHeight || 400,
         });
       }
     });
@@ -68,17 +97,20 @@ export default function ImageEditor({
     return () => obs.disconnect();
   }, [displayUrl]);
 
-  /* ── Filter applied callback ── */
+  /* ── Filter callbacks ── */
   const handleFilteredUrl = useCallback((url) => {
     setDisplayUrl(url);
-    if (page) onUpdate(page.id, { dataUrl: url, filter: activeFilter });
-  }, [page, activeFilter, onUpdate]);
+    if (page) onUpdate(page.id, { dataUrl: url, filter: activeFilterRef.current });
+  }, [page, onUpdate]);
 
-  const handleFilterChange = useCallback((id) => setActiveFilter(id), []);
+  const handleFilterChange = useCallback((id) => {
+    setActiveFilter(id);
+    activeFilterRef.current = id;
+  }, []);
 
   /* ── Transform controls ── */
-  const rotate = (deg) => setRotation(r => r + deg);
-  const resetTransform = () => { setRotation(0); setFlipH(false); setZoom(1); };
+  const rotate       = (deg) => setRotation(r => r + deg);
+  const resetTransform = ()  => { setRotation(0); setFlipH(false); setZoom(1); };
 
   /* ── Page navigation ── */
   const currentIdx = pages.findIndex(p => p.id === activePageId);
@@ -95,144 +127,178 @@ export default function ImageEditor({
   }, [displayUrl, page, onUpdate]);
 
   /* ── Crop workflow ── */
-  const handleStartCrop = async () => {
+  const handleStartCrop = useCallback(async () => {
     const rawUrl = page.originalDataUrl || page.dataUrl;
     setDisplayUrl(rawUrl);
     setShowCrop(true);
+    // Reset transforms so crop overlay coordinates match visual position
+    setRotation(0); setFlipH(false); setZoom(1);
 
-    if (!cropCorners) {
-      setCropProcessing(true);
-      const corners = page.cropCorners || await detectDocumentCorners(rawUrl);
+    // Always fresh-detect when entering crop
+    setCropProcessing(true);
+    setCropCorners(null);
+    try {
+      const corners = await detectDocumentCorners(rawUrl);
       setCropCorners(corners);
-      setCropProcessing(false);
+    } catch (e) {
+      // Safe default: full-image rectangle with small margin
+      setCropCorners([
+        { x: 0.05, y: 0.05 }, { x: 0.95, y: 0.05 },
+        { x: 0.95, y: 0.95 }, { x: 0.05, y: 0.95 },
+      ]);
     }
-  };
+    setCropProcessing(false);
+  }, [page]);
 
-  const handleApplyCrop = async () => {
+  const handleApplyCrop = useCallback(async () => {
     if (!cropCorners) { setShowCrop(false); setDisplayUrl(page.dataUrl); return; }
     setCropProcessing(true);
     try {
-      const rawUrl   = page.originalDataUrl || page.dataUrl;
+      // Always warp from the pristine original
+      const rawUrl    = page.originalDataUrl || page.dataUrl;
       const warpedUrl = await applyPerspectiveTransform(rawUrl, cropCorners);
-      onUpdate(page.id, { dataUrl: warpedUrl, cropCorners });
+      onUpdate(page.id, {
+        dataUrl:         warpedUrl,
+        originalDataUrl: rawUrl,      // ← preserve pristine source for re-crops
+        cropCorners:     cropCorners,
+      });
       setDisplayUrl(warpedUrl);
-    } catch (e) { console.error(e); setDisplayUrl(page.dataUrl); }
+      setCropCorners(null);           // ← clear so next open re-detects on new image
+    } catch (e) {
+      console.error('Crop failed:', e);
+      setDisplayUrl(page.dataUrl);
+    }
     setCropProcessing(false);
     setShowCrop(false);
-  };
+  }, [cropCorners, page, onUpdate]);
 
-  const handleCancelCrop = () => {
+  const handleCancelCrop = useCallback(() => {
     setShowCrop(false);
+    setCropCorners(null);
     setDisplayUrl(page.dataUrl);
-  };
+  }, [page]);
 
+  /* ── Guards ── */
   if (!page) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-4"
-           style={{ color: 'var(--clr-text-muted)' }}>
-        <div style={{ fontSize: 64, opacity: 0.15 }}>📄</div>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, color: 'var(--clr-text-muted)' }}>
+        <div style={{ fontSize: 64, opacity: 0.12 }}>📄</div>
         <p style={{ fontSize: 15 }}>No page selected</p>
       </div>
     );
   }
 
-  const transformStyle = {
-    transform: `rotate(${rotation}deg) scaleX(${flipH ? -1 : 1}) scale(${zoom})`,
-    transition: 'transform 0.2s ease',
-    maxWidth: '100%',
-    maxHeight: '100%',
-    objectFit: 'contain',
-    display: 'block',
-  };
-
   const isCropMode       = showCrop;
   const isAnnotationMode = showAnnotation;
 
-  return (
-    <div className="flex flex-1 min-h-0" style={{ flexDirection: 'column', position: 'relative' }}>
+  // Image style — explicit pixel max-constraints break the circular-reference
+  // problem where `maxWidth: 100%` would be relative to the inline-block parent
+  // which itself sizes from the image.
+  const imgStyle = {
+    display:    'block',
+    maxWidth:   viewSize.w,
+    maxHeight:  viewSize.h,
+    width:      'auto',
+    height:     'auto',
+    objectFit:  'contain',
+    transform:  `rotate(${rotation}deg) scaleX(${flipH ? -1 : 1}) scale(${zoom})`,
+    transition: 'transform 0.2s ease',
+    userSelect: 'none',
+    WebkitUserSelect: 'none',
+  };
 
-      {/* ══════════════ TOP BAR ══════════════ */}
+  return (
+    <div style={{ display: 'flex', flex: 1, minHeight: 0, flexDirection: 'column', position: 'relative' }}>
+
+      {/* ══════════════════════ TOP BAR ══════════════════════ */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: '0 12px', height: 48, flexShrink: 0,
         background: 'var(--clr-bg-surface)',
         borderBottom: '1px solid var(--clr-border)',
       }}>
-        {/* Page navigation left */}
-        <div className="flex items-center gap-1">
+        {/* Page nav */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           <button className="btn btn-ghost btn-icon btn-sm"
                   onClick={() => hasPrev && setActivePageId(pages[currentIdx - 1].id)}
                   disabled={!hasPrev}>
             <ChevronLeft size={16} />
           </button>
-          <span style={{ color: 'var(--clr-text-secondary)', fontSize: 13, fontWeight: 600 }}>
+          <span style={{ color: 'var(--clr-text-secondary)', fontSize: 13, fontWeight: 600, minWidth: 40, textAlign: 'center' }}>
             {currentIdx + 1} / {pages.length}
           </span>
           <button className="btn btn-ghost btn-icon btn-sm"
                   onClick={() => hasNext && setActivePageId(pages[currentIdx + 1].id)}
                   disabled={!hasNext}>
-            <ChevronRight size={16} />
+            <ChevronLeft size={16} style={{ transform: 'rotate(180deg)' }} />
           </button>
         </div>
 
-        {/* Zoom controls */}
-        <div className="flex items-center gap-1">
-          <button className="btn btn-ghost btn-icon btn-sm"
-                  onClick={() => setZoom(z => Math.max(0.25, z - 0.25))}>
+        {/* Zoom */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <button className="btn btn-ghost btn-icon btn-sm" onClick={() => setZoom(z => Math.max(0.25, z - 0.25))}>
             <ZoomOut size={14} />
           </button>
-          <span style={{ color: 'var(--clr-text-muted)', fontSize: 11, minWidth: 34, textAlign: 'center' }}>
+          <span style={{ color: 'var(--clr-text-muted)', fontSize: 11, minWidth: 36, textAlign: 'center' }}>
             {Math.round(zoom * 100)}%
           </span>
-          <button className="btn btn-ghost btn-icon btn-sm"
-                  onClick={() => setZoom(z => Math.min(4, z + 0.25))}>
+          <button className="btn btn-ghost btn-icon btn-sm" onClick={() => setZoom(z => Math.min(4, z + 0.25))}>
             <ZoomIn size={14} />
           </button>
-          <button className="btn btn-ghost btn-icon btn-sm tooltip" data-tip="Reset view"
-                  onClick={resetTransform} style={{ marginLeft: 2 }}>
+          <button className="btn btn-ghost btn-icon btn-sm" onClick={resetTransform} style={{ marginLeft: 2 }}>
             <Maximize2 size={13} />
           </button>
         </div>
       </div>
 
-      {/* ══════════════ CANVAS VIEWPORT ══════════════ */}
+      {/* ══════════════════════ CANVAS VIEWPORT ══════════════════════ */}
       <div
-        ref={wrapRef}
-        className="flex-1 relative flex items-center justify-center overflow-hidden"
-        style={{ background: 'repeating-conic-gradient(#0f1116 0% 25%, #090c12 0% 50%) 0 0 / 20px 20px' }}
+        ref={viewRef}
+        style={{
+          flex: 1, minHeight: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          overflow: 'hidden', padding: 16,
+          background: 'repeating-conic-gradient(#0f1116 0% 25%, #090c12 0% 50%) 0 0 / 20px 20px',
+        }}
       >
-        <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-                      width: '100%', height: '100%', padding: 16 }}>
+        {/*
+          ── Inline-block wrapper ──────────────────────────────────────
+          Shrinks to exactly the rendered image size because the image
+          has explicit pixel max-constraints from `viewSize`.
+          All absolute-positioned overlays are relative to THIS div.
+        */}
+        <div style={{ position: 'relative', display: 'inline-block', lineHeight: 0 }}>
           <img
             ref={imgRef}
             src={displayUrl}
-            alt="Scanned page"
-            style={transformStyle}
+            alt="Scanned document page"
+            style={imgStyle}
             draggable={false}
             onLoad={() => {
-              if (imgRef.current) setImgDims({
-                w: imgRef.current.clientWidth,
-                h: imgRef.current.clientHeight,
-              });
+              if (imgRef.current) {
+                setImgDims({ w: imgRef.current.offsetWidth, h: imgRef.current.offsetHeight });
+              }
             }}
           />
 
           {/* Annotation overlay */}
           {isAnnotationMode && (
-            <AnnotationLayer
-              width={imgDims.w || 800}
-              height={imgDims.h || 600}
-              onBake={fn => { bakeRef.current = fn; }}
-            />
+            <div style={{ position: 'absolute', top: 0, left: 0, width: imgDims.w, height: imgDims.h, zIndex: 40 }}>
+              <AnnotationLayer
+                width={imgDims.w}
+                height={imgDims.h}
+                onBake={fn => { bakeRef.current = fn; }}
+              />
+            </div>
           )}
 
-          {/* Crop overlay */}
+          {/* Crop overlay — only shown when corners are ready */}
           {isCropMode && cropCorners && !cropProcessing && (
             <CropPanel
               corners={cropCorners}
               onChange={setCropCorners}
-              width={imgDims.w || 800}
-              height={imgDims.h || 600}
+              width={imgDims.w}
+              height={imgDims.h}
             />
           )}
 
@@ -241,23 +307,26 @@ export default function ImageEditor({
             <div style={{
               position: 'absolute', inset: 0,
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              background: 'rgba(0,0,0,0.5)',
+              background: 'rgba(0,0,0,0.6)',
+              borderRadius: 4,
+              zIndex: 60,
             }}>
               <div style={{ textAlign: 'center', color: 'var(--clr-brand-400)' }}>
-                <Loader2 size={32} style={{ animation: 'spin 1s linear infinite', marginBottom: 8 }} />
-                <div style={{ fontSize: 13, fontWeight: 500 }}>Detecting edges…</div>
+                <Loader2 size={36} style={{ animation: 'spin 1s linear infinite' }} />
+                <div style={{ fontSize: 13, fontWeight: 600, marginTop: 10, letterSpacing: '0.04em' }}>
+                  Detecting edges…
+                </div>
               </div>
             </div>
           )}
         </div>
       </div>
 
-      {/* ══════════════ OCR PANEL (slide-in) ══════════════ */}
+      {/* OCR panel (slide-in) */}
       {showOcr && (
         <div className="slide-right" style={{
           position: 'absolute', top: 48, right: 0, bottom: 0,
-          width: 300, zIndex: 30,
-          display: 'flex', flexDirection: 'column',
+          width: 300, zIndex: 30, display: 'flex', flexDirection: 'column',
         }}>
           <OcrPanel
             dataUrl={displayUrl}
@@ -267,7 +336,7 @@ export default function ImageEditor({
         </div>
       )}
 
-      {/* ══════════════ FILTER TRAY ══════════════ */}
+      {/* Filter tray */}
       {!isCropMode && !isAnnotationMode && (
         <FilterTray
           dataUrl={page.originalDataUrl || page.dataUrl}
@@ -277,10 +346,8 @@ export default function ImageEditor({
         />
       )}
 
-      {/* ══════════════ BOTTOM NAV BAR ══════════════ */}
+      {/* ══════════════════════ BOTTOM NAV BAR ══════════════════════ */}
       <div className="editor-bottom-bar">
-
-        {/* Crop mode controls */}
         {isCropMode ? (
           <>
             <button className="bottom-btn" onClick={handleCancelCrop}>
@@ -290,10 +357,9 @@ export default function ImageEditor({
             <button className="bottom-btn-confirm" onClick={handleApplyCrop} disabled={cropProcessing}>
               {cropProcessing
                 ? <Loader2 size={26} style={{ animation: 'spin 1s linear infinite' }} />
-                : <Check size={26} />
-              }
+                : <Check size={26} />}
             </button>
-            <button className="bottom-btn" onClick={() => { setCropCorners(null); handleStartCrop(); }}>
+            <button className="bottom-btn" onClick={handleStartCrop} disabled={cropProcessing}>
               <div className="bottom-btn-icon"><Crop size={20} /></div>
               <span>Re-detect</span>
             </button>
@@ -310,33 +376,23 @@ export default function ImageEditor({
             <div className="bottom-btn" style={{ opacity: 0, pointerEvents: 'none' }} />
           </>
         ) : (
-          /* Default nav */
           <>
-            {/* Rotate */}
             <button className="bottom-btn" onClick={() => rotate(-90)}>
               <div className="bottom-btn-icon"><RotateCcw size={20} /></div>
               <span>Rotate</span>
             </button>
-
-            {/* Flip */}
             <button className="bottom-btn" onClick={() => setFlipH(f => !f)}>
               <div className="bottom-btn-icon"><FlipHorizontal2 size={20} /></div>
               <span>Flip</span>
             </button>
-
-            {/* CROP — centre hero button */}
             <button className="bottom-btn-confirm" onClick={handleStartCrop} title="Crop & Deskew">
               <Crop size={26} />
             </button>
-
-            {/* Markup / Annotate */}
             <button className={`bottom-btn ${isAnnotationMode ? 'bottom-btn-active' : ''}`}
                     onClick={() => setShowAnnotation(s => !s)}>
               <div className="bottom-btn-icon"><PenLine size={20} /></div>
               <span>Markup</span>
             </button>
-
-            {/* OCR */}
             <button className={`bottom-btn ${showOcr ? 'bottom-btn-active' : ''}`}
                     onClick={() => setShowOcr(s => !s)}>
               <div className="bottom-btn-icon"><ScanText size={20} /></div>

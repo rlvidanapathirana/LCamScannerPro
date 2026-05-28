@@ -463,7 +463,7 @@ select:focus, input[type="text"]:focus, textarea:focus {
 /* ── Responsive ── */
 @media (max-width: 768px) {
   body { overflow: hidden; }
-  #app { height: 100vh; }
+  #app { height: 100dvh; }
 
   .mobile-col { flex-direction: column !important; }
 

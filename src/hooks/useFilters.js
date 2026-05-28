@@ -1,9 +1,9 @@
 /**
  * useFilters.js
  * Applies a named filter to an image (dataUrl) → returns filtered dataUrl.
- * Processing happens on an off-screen canvas so the UI never blocks.
+ * FIX: Each call creates its own canvas to prevent concurrent-access black screens.
  */
-import { useCallback, useRef } from 'react';
+import { useCallback } from 'react';
 import {
   filterOriginal, filterLighten, filterMagicColor,
   filterBW, filterGrayscale, filterEco,
@@ -26,37 +26,35 @@ const FILTER_MAP = {
 };
 
 export function useFilters() {
-  const canvasRef = useRef(document.createElement('canvas'));
-
   /**
    * Apply a filter to a dataUrl.
-   * @param {string} dataUrl  — source image
-   * @param {string} filterId — key from FILTER_MAP
-   * @param {object} opts     — extra options (e.g. curvature for flattenPage)
-   * @returns {Promise<string>} filtered dataUrl
+   * Each call gets its OWN canvas — prevents concurrent preview renders from
+   * wiping each other out and producing a black image.
    */
   const applyFilter = useCallback((dataUrl, filterId, opts = {}) => {
     return new Promise((resolve, reject) => {
       if (!dataUrl) return reject(new Error('No image'));
       const filterFn = FILTER_MAP[filterId] || filterOriginal;
+
       const img = new Image();
       img.onload = () => {
-        const canvas = canvasRef.current;
+        // ── Fresh canvas every call — the key fix for the black-screen bug ──
+        const canvas  = document.createElement('canvas');
         canvas.width  = img.naturalWidth;
         canvas.height = img.naturalHeight;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(img, 0, 0);
+
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
         let result;
         try {
-          if (filterId === 'flattenPage') {
-            result = filterFn(imageData, opts.curvature ?? 0.3);
-          } else {
-            result = filterFn(imageData, opts);
-          }
+          result = filterId === 'flattenPage'
+            ? filterFn(imageData, opts.curvature ?? 0.3)
+            : filterFn(imageData, opts);
         } catch (e) {
-          result = imageData; // fallback to original on error
+          console.error('Filter error:', filterId, e);
+          result = imageData; // safe fallback
         }
 
         ctx.putImageData(result, 0, 0);

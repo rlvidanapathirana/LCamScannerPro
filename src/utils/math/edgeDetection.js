@@ -1,168 +1,117 @@
 /**
  * edgeDetection.js
- * Highly robust document boundary detection using:
- * 1. Grayscale & blur
- * 2. Otsu's Thresholding
- * 3. Connected Component Labeling (Blob extraction)
- * 4. Finding the largest solid object
- * 5. Extreme point projection (Corners)
+ * 100% Client-Side OpenCV.js Edge Detection
+ * Highly robust document boundary detection using Canny + Contours.
  */
 
+import { waitForOpenCV } from '../cvLoader';
+
 export async function detectDocumentCorners(dataUrl) {
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
     const defaultCorners = [
       { x: 0.05, y: 0.05 }, { x: 0.95, y: 0.05 },
       { x: 0.95, y: 0.95 }, { x: 0.05, y: 0.95 }
     ];
 
+    try {
+      await waitForOpenCV();
+    } catch (e) {
+      console.warn("OpenCV timeout, returning default corners");
+      return resolve(defaultCorners);
+    }
+
     const img = new Image();
     img.onload = () => {
-      // Downscale for extreme performance (150px max dim)
-      const MAX_DIM = 150;
-      const scale = Math.min(1, MAX_DIM / Math.max(img.naturalWidth, img.naturalHeight));
-      const w = Math.max(1, Math.floor(img.naturalWidth * scale));
-      const h = Math.max(1, Math.floor(img.naturalHeight * scale));
-      const totalPixels = w * h;
+      try {
+        const mat = cv.imread(img);
+        
+        // Downscale for performance while retaining edge clarity
+        const maxDim = 800;
+        const scale = Math.min(1, maxDim / Math.max(mat.cols, mat.rows));
+        
+        const resized = new cv.Mat();
+        cv.resize(mat, resized, new cv.Size(0, 0), scale, scale, cv.INTER_AREA);
 
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(img, 0, 0, w, h);
+        // Grayscale
+        const gray = new cv.Mat();
+        cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY, 0);
 
-      const imgData = ctx.getImageData(0, 0, w, h);
-      const data = imgData.data;
+        // Blur to remove noise
+        const blurred = new cv.Mat();
+        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
 
-      // 1. Grayscale
-      const gray = new Uint8Array(totalPixels);
-      const hist = new Int32Array(256);
-      for (let i = 0; i < totalPixels; i++) {
-        const idx = i * 4;
-        const lum = Math.floor(0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2]);
-        gray[i] = lum;
-        hist[lum]++;
-      }
+        // Canny edge detection
+        const edges = new cv.Mat();
+        cv.Canny(blurred, edges, 75, 200, 3, false);
 
-      // 2. Otsu's Thresholding
-      let sum = 0;
-      for (let i = 0; i < 256; i++) sum += i * hist[i];
-      let sumB = 0, wB = 0, wF = 0, varMax = 0, threshold = 0;
-      for (let i = 0; i < 256; i++) {
-        wB += hist[i];
-        if (wB === 0) continue;
-        wF = totalPixels - wB;
-        if (wF === 0) break;
-        sumB += i * hist[i];
-        const mB = sumB / wB;
-        const mF = (sum - sumB) / wF;
-        const varBetween = wB * wF * (mB - mF) * (mB - mF);
-        if (varBetween > varMax) {
-          varMax = varBetween;
-          threshold = i;
-        }
-      }
+        // Dilate to close small gaps in the edges
+        const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+        const dilated = new cv.Mat();
+        cv.dilate(edges, dilated, kernel, new cv.Point(-1, -1), 1, cv.BORDER_CONSTANT, cv.morphologyDefaultBorderValue());
 
-      // 3. Binary map
-      // We assume the paper contrasts strongly with the desk.
-      // Usually, paper is brighter than the desk.
-      const binary = new Uint8Array(totalPixels);
-      for (let i = 0; i < totalPixels; i++) {
-        binary[i] = gray[i] > threshold ? 1 : 0;
-      }
+        // Find contours
+        const contours = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-      // 4. Connected Components (Flood Fill)
-      const labels = new Int32Array(totalPixels);
-      let nextLabel = 1;
-      const componentSizes = {};
+        let maxArea = 0;
+        let bestApprox = null;
 
-      const floodFill = (startX, startY, label) => {
-        const queue = [{ x: startX, y: startY }];
-        labels[startY * w + startX] = label;
-        let size = 0;
+        // Iterate to find the largest 4-point polygon
+        for (let i = 0; i < contours.size(); ++i) {
+          const cnt = contours.get(i);
+          const area = cv.contourArea(cnt);
+          
+          if (area > maxArea) {
+            const peri = cv.arcLength(cnt, true);
+            const approx = new cv.Mat();
+            cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
 
-        let head = 0;
-        while (head < queue.length) {
-          const p = queue[head++];
-          size++;
-          // check neighbors
-          const dirs = [[1,0], [-1,0], [0,1], [0,-1]];
-          for (let d of dirs) {
-            const nx = p.x + d[0], ny = p.y + d[1];
-            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-              const nIdx = ny * w + nx;
-              if (binary[nIdx] === 1 && labels[nIdx] === 0) {
-                labels[nIdx] = label;
-                queue.push({ x: nx, y: ny });
-              }
+            if (approx.rows === 4) {
+              maxArea = area;
+              if (bestApprox) bestApprox.delete();
+              bestApprox = approx;
+            } else {
+              approx.delete();
             }
           }
+          cnt.delete();
         }
-        return size;
-      };
 
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          if (binary[y * w + x] === 1 && labels[y * w + x] === 0) {
-            const size = floodFill(x, y, nextLabel);
-            componentSizes[nextLabel] = size;
-            nextLabel++;
+        // If a valid document shape was found (must be at least 10% of the image area)
+        if (bestApprox && maxArea > (resized.cols * resized.rows * 0.1)) {
+          // Extract points and normalize to 0..1 range
+          const pts = [];
+          for (let i = 0; i < 4; i++) {
+            pts.push({
+              x: Math.max(0, Math.min(1, bestApprox.data32S[i * 2] / resized.cols)),
+              y: Math.max(0, Math.min(1, bestApprox.data32S[i * 2 + 1] / resized.rows))
+            });
           }
+          
+          // Sort points to guarantee TL, TR, BR, BL order
+          pts.sort((a, b) => a.y - b.y); // Top 2 and Bottom 2
+          const top = pts.slice(0, 2).sort((a, b) => a.x - b.x); // TL, TR
+          const bottom = pts.slice(2, 4).sort((a, b) => b.x - a.x); // BR, BL
+          
+          const ordered = [top[0], top[1], bottom[0], bottom[1]];
+          
+          resolve(ordered);
+        } else {
+          resolve(defaultCorners);
         }
-      }
 
-      // 5. Find the largest component (Blob)
-      let largestLabel = 0;
-      let largestSize = 0;
-      for (const [lbl, size] of Object.entries(componentSizes)) {
-        if (size > largestSize) {
-          largestSize = size;
-          largestLabel = parseInt(lbl);
-        }
-      }
+        // Memory management (Crucial in OpenCV.js)
+        mat.delete(); resized.delete(); gray.delete(); blurred.delete(); 
+        edges.delete(); dilated.delete(); kernel.delete(); 
+        contours.delete(); hierarchy.delete();
+        if (bestApprox) bestApprox.delete();
 
-      // If the largest object is suspiciously small (less than 5% of image), fail gracefully
-      if (largestSize < totalPixels * 0.05) {
-        return resolve(defaultCorners);
-      }
-
-      // 6. Find Extreme Points (Corners) of ONLY the largest component
-      let min_plus = Infinity, tl = null;
-      let max_minus = -Infinity, tr = null;
-      let max_plus = -Infinity, br = null;
-      let min_minus = Infinity, bl = null;
-
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          if (labels[y * w + x] === largestLabel) {
-            const plus = x + y;
-            const minus = x - y;
-
-            if (plus < min_plus)   { min_plus = plus; tl = { x, y }; }
-            if (minus > max_minus) { max_minus = minus; tr = { x, y }; }
-            if (plus > max_plus)   { max_plus = plus; br = { x, y }; }
-            if (minus < min_minus) { min_minus = minus; bl = { x, y }; }
-          }
-        }
-      }
-
-      if (tl && tr && br && bl) {
-        // Expand slightly outwards to not clip the exact edges of the paper
-        const expand = (pt, signX, signY) => ({
-          x: Math.max(0, Math.min(1, (pt.x + signX * 2) / w)),
-          y: Math.max(0, Math.min(1, (pt.y + signY * 2) / h))
-        });
-        
-        resolve([
-          expand(tl, -1, -1),
-          expand(tr, 1, -1),
-          expand(br, 1, 1),
-          expand(bl, -1, 1)
-        ]);
-      } else {
+      } catch (err) {
+        console.error("OpenCV edge detection failed:", err);
         resolve(defaultCorners);
       }
     };
-    
     img.onerror = () => resolve(defaultCorners);
     img.src = dataUrl;
   });
